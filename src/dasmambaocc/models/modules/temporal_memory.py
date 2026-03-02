@@ -41,8 +41,10 @@ class FeatureMemoryBank(nn.Module):
         self._memory: "OrderedDict[str, torch.Tensor]" = OrderedDict()
         self._last_timestamp: "OrderedDict[str, int]" = OrderedDict()
         self._pose_memory: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+        self._aug_memory: "OrderedDict[str, torch.Tensor]" = OrderedDict()
         self._warned_non_temporal_key = False
         self._warned_missing_pose = False
+        self._warned_missing_aug = False
 
     @staticmethod
     def _key_from_meta(meta: Dict[str, Any], sample_idx: int) -> str:
@@ -79,6 +81,7 @@ class FeatureMemoryBank(nn.Module):
             key, _ = self._memory.popitem(last=False)
             self._last_timestamp.pop(key, None)
             self._pose_memory.pop(key, None)
+            self._aug_memory.pop(key, None)
 
     @staticmethod
     def _sanitize(x: torch.Tensor) -> torch.Tensor:
@@ -98,7 +101,7 @@ class FeatureMemoryBank(nn.Module):
         return 0 < delta <= self.max_timestamp_gap
 
     @staticmethod
-    def _to_pose_tensor(pose_like, device: torch.device) -> torch.Tensor:
+    def _to_transform_tensor(pose_like, device: torch.device) -> torch.Tensor:
         pose = torch.as_tensor(pose_like, device=device, dtype=torch.float32)
         if pose.dim() == 3:
             pose = pose[0]
@@ -106,14 +109,14 @@ class FeatureMemoryBank(nn.Module):
             return None
         return pose
 
-    def _extract_current_pose(self, ego2global, sample_idx: int, device: torch.device) -> torch.Tensor:
-        if ego2global is None:
+    def _extract_current_transform(self, mats, sample_idx: int, device: torch.device) -> torch.Tensor:
+        if mats is None:
             return None
         try:
-            pose_like = ego2global[sample_idx]
+            mat_like = mats[sample_idx]
         except Exception:
             return None
-        return self._to_pose_tensor(pose_like, device=device)
+        return self._to_transform_tensor(mat_like, device=device)
 
     @staticmethod
     def _safe_inverse(mat: torch.Tensor) -> torch.Tensor:
@@ -151,9 +154,15 @@ class FeatureMemoryBank(nn.Module):
         hist: torch.Tensor,
         prev_pose: torch.Tensor,
         curr_pose: torch.Tensor,
+        prev_aug: torch.Tensor = None,
+        curr_aug: torch.Tensor = None,
     ) -> torch.Tensor:
         # rel pose maps points from current ego frame to previous ego frame.
         rel_pose = self._safe_inverse(prev_pose) @ curr_pose
+        if prev_aug is not None and curr_aug is not None:
+            # Features are in per-frame lidar-augmented space. Convert
+            # current_aug -> current_raw -> prev_raw -> prev_aug for warping.
+            rel_pose = prev_aug @ rel_pose @ self._safe_inverse(curr_aug)
         theta = self._theta_from_relative_pose(rel_pose, device=hist.device)
 
         hist_batch = hist.unsqueeze(0).float()
@@ -172,6 +181,7 @@ class FeatureMemoryBank(nn.Module):
         feats: torch.Tensor,
         metas: Iterable[Dict[str, Any]] = None,
         ego2global: torch.Tensor = None,
+        lidar_aug_matrix: torch.Tensor = None,
     ) -> torch.Tensor:
         if metas is None:
             return feats
@@ -187,15 +197,35 @@ class FeatureMemoryBank(nn.Module):
             timestamp = self._timestamp_from_meta(meta)
             can_blend = self._can_blend(key, timestamp)
             hist = self._memory.get(key) if can_blend else None
-            curr_pose = self._extract_current_pose(ego2global, i, device=feats.device)
+            curr_pose = self._extract_current_transform(ego2global, i, device=feats.device)
             prev_pose = self._pose_memory.get(key) if can_blend else None
+            curr_aug = self._extract_current_transform(lidar_aug_matrix, i, device=feats.device)
+            prev_aug = self._aug_memory.get(key) if can_blend else None
 
             if hist is not None:
                 hist = self._sanitize(hist.to(device=feats.device, dtype=feats.dtype))
                 if self.enable_pose_warp:
                     if curr_pose is not None and prev_pose is not None:
                         prev_pose = prev_pose.to(device=feats.device, dtype=torch.float32)
-                        hist = self._warp_history_to_current(hist, prev_pose=prev_pose, curr_pose=curr_pose)
+                        if (curr_aug is None) ^ (prev_aug is None):
+                            hist = None
+                            if not self._warned_missing_aug:
+                                warnings.warn(
+                                    "FeatureMemoryBank received inconsistent lidar_aug_matrix across frames; "
+                                    "temporal blending is skipped for safety.",
+                                    stacklevel=2,
+                                )
+                                self._warned_missing_aug = True
+                        else:
+                            if prev_aug is not None:
+                                prev_aug = prev_aug.to(device=feats.device, dtype=torch.float32)
+                            hist = self._warp_history_to_current(
+                                hist,
+                                prev_pose=prev_pose,
+                                curr_pose=curr_pose,
+                                prev_aug=prev_aug,
+                                curr_aug=curr_aug,
+                            )
                     else:
                         hist = None
                         if not self._warned_missing_pose:
@@ -228,10 +258,15 @@ class FeatureMemoryBank(nn.Module):
                         self._pose_memory[key] = curr_pose.detach().cpu()
                     elif key in self._pose_memory:
                         self._pose_memory.pop(key, None)
+                    if curr_aug is not None and torch.isfinite(curr_aug).all():
+                        self._aug_memory[key] = curr_aug.detach().cpu()
+                    elif key in self._aug_memory:
+                        self._aug_memory.pop(key, None)
                 elif key in self._memory:
                     self._memory.pop(key, None)
                     self._last_timestamp.pop(key, None)
                     self._pose_memory.pop(key, None)
+                    self._aug_memory.pop(key, None)
 
             if (
                 not self._warned_non_temporal_key

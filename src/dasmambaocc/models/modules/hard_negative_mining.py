@@ -8,6 +8,7 @@ def hard_negative_suppression_loss(
     occ_pred: torch.Tensor,
     det_guidance_xy: Optional[torch.Tensor],
     mask_camera: Optional[torch.Tensor],
+    voxel_semantics: Optional[torch.Tensor],
     empty_class_idx: int,
     guidance_threshold: float,
     loss_weight: float,
@@ -46,7 +47,20 @@ def hard_negative_suppression_loss(
         valid_mask = torch.ones_like(nonempty_prob, dtype=torch.bool)
     else:
         valid_mask = mask_camera.to(torch.bool)
-    neg_mask = valid_mask & (~det_mask)
+
+    if voxel_semantics is None:
+        empty_gt_mask = torch.ones_like(nonempty_prob, dtype=torch.bool)
+    else:
+        gt = voxel_semantics.to(device=occ_pred.device)
+        if gt.shape != nonempty_prob.shape:
+            raise ValueError(
+                f"voxel_semantics shape {tuple(gt.shape)} must match occupancy grid "
+                f"shape {tuple(nonempty_prob.shape)}"
+            )
+        empty_gt_mask = gt.to(torch.long) == int(empty_class_idx)
+
+    # Suppress only where detector is silent and GT confirms empty voxels.
+    neg_mask = valid_mask & (~det_mask) & empty_gt_mask
 
     if int(neg_mask.sum()) == 0:
         return occ_pred.new_tensor(0.0)

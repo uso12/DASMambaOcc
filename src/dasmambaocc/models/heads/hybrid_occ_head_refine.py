@@ -120,13 +120,18 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         img_feats = einops.rearrange(img_feats, "bs c w h -> bs c h w")
         img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # Temporal memory must run in pre-coordinate-transform space.
-        # Coordinate transform applies per-sample occupancy augmentation (flip/rot/scale);
-        # blending already-augmented features with raw ego-motion poses causes desync.
+        # Temporal memory runs before occupancy-grid coordinate transform.
+        # Input features are still lidar-augmented from upstream BEV lifting/fusion;
+        # memory bank handles per-frame lidar_aug_matrix when pose-warping history.
         if self.use_temporal_memory:
             if ego2global is None:
                 ego2global = camera_ego2global
-            img_feats = self.temporal_memory(img_feats, metas=metas, ego2global=ego2global)
+            img_feats = self.temporal_memory(
+                img_feats,
+                metas=metas,
+                ego2global=ego2global,
+                lidar_aug_matrix=lidar_aug_matrix,
+            )
             img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
 
         if self.coordinate_transform is not None:
@@ -222,6 +227,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
                 occ_pred=occ_pred,
                 det_guidance_xy=guidance,
                 mask_camera=mask_camera,
+                voxel_semantics=voxel_semantics,
                 empty_class_idx=self.empty_class_idx,
                 guidance_threshold=self.hard_negative_threshold,
                 loss_weight=self.hard_negative_weight,
