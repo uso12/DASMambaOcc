@@ -43,7 +43,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         enable_refine_subhead: bool = True,
         refine_subhead: Optional[dict] = None,
         coarse_aux_weight: float = 0.2,
-        refine_consistency_weight: float = 0.05,
+        refine_consistency_weight: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -315,10 +315,10 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
             and self._cached_occ_coarse.shape == occ_pred.shape
             and self._cached_occ_coarse.data_ptr() != occ_pred.data_ptr()
         ):
-            # Distill refined prediction into the coarse branch to avoid
-            # anchoring the refiner back to coarse mistakes.
-            log_p = F.log_softmax(self._cached_occ_coarse, dim=-1)
-            q = F.softmax(occ_pred.detach(), dim=-1)
+            # Keep coarse branch as teacher by default to avoid destabilizing
+            # pretrained coarse logits with online student errors.
+            log_p = F.log_softmax(occ_pred, dim=-1)
+            q = F.softmax(self._cached_occ_coarse.detach(), dim=-1)
             kl = F.kl_div(log_p, q, reduction="none").sum(dim=-1)
             if mask_camera is not None:
                 valid_mask = mask_camera.to(dtype=torch.bool)
