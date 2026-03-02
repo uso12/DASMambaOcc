@@ -131,6 +131,7 @@ train_pipeline:
       - camera_intrinsics
       - camera2ego
       - camera_ego2global
+      - ego2global
       - lidar2ego
       - lidar2camera
       - camera2lidar
@@ -206,6 +207,7 @@ test_pipeline:
       - camera_intrinsics
       - camera2ego
       - camera_ego2global
+      - ego2global
       - lidar2ego
       - lidar2camera
       - camera2lidar
@@ -214,7 +216,7 @@ test_pipeline:
       - lidar_aug_matrix
       - occ_aug_matrix
 
-use_cbgs: true
+use_cbgs: false
 
 train_dataset:
   type: ${dataset_type}

@@ -49,6 +49,14 @@ def _check_config_and_model(cfg_paths: List[Path], skip_model_build: bool, requi
 
     logging.getLogger("mmcv").setLevel(logging.WARNING)
 
+    def _collect_meta_keys(pipeline):
+        if pipeline is None:
+            return []
+        for item in pipeline:
+            if isinstance(item, dict) and item.get("type", "") == "Collect3D":
+                return list(item.get("meta_keys", []))
+        return []
+
     for cfg_path in cfg_paths:
         _echo(f"Loading config: {cfg_path}")
         cfg = _load_cfg(cfg_path)
@@ -67,6 +75,14 @@ def _check_config_and_model(cfg_paths: List[Path], skip_model_build: bool, requi
                 f"Temporal memory is enabled but CBGS is active in {cfg_path}. "
                 "Set use_cbgs=false or disable temporal memory."
             )
+        if use_temporal_memory:
+            train_meta_keys = _collect_meta_keys(cfg.get("train_pipeline", None))
+            test_meta_keys = _collect_meta_keys(cfg.get("test_pipeline", None))
+            if "ego2global" not in train_meta_keys or "ego2global" not in test_meta_keys:
+                raise RuntimeError(
+                    f"Temporal memory is enabled but ego2global is missing from Collect3D meta_keys "
+                    f"in train/test pipelines: {cfg_path}"
+                )
 
         if skip_model_build:
             continue
@@ -167,9 +183,12 @@ def _check_guidance_and_temporal_modules() -> None:
     cam_vec = AdaptiveLiftingBEVTransformV2._camera_condition_vector(intr, aug)
     if cam_vec is None or cam_vec.shape[-1] != 8:
         raise RuntimeError("Camera condition vector check failed: invalid output shape")
-    aug_mag = float(cam_vec[..., 4:].abs().mean())
-    if aug_mag < 0.1:
-        raise RuntimeError("Camera condition vector check failed: augmentation terms were over-suppressed")
+    scale_mag = float(cam_vec[..., 4:6].abs().mean())
+    trans_mag = float(cam_vec[..., 6:8].abs().mean())
+    if scale_mag < 0.3:
+        raise RuntimeError("Camera condition vector check failed: scale terms were over-suppressed")
+    if trans_mag < 0.3:
+        raise RuntimeError("Camera condition vector check failed: translation terms were over-suppressed")
 
     _echo("Checking temporal memory gradient flow")
     bank = FeatureMemoryBank(momentum=0.9, blend=0.25, max_entries=16)
