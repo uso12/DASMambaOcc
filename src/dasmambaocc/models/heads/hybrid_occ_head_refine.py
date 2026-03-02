@@ -102,6 +102,95 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         self._cached_guidance_xy: Optional[torch.Tensor] = None
         self._cached_occ_coarse: Optional[torch.Tensor] = None
 
+    @staticmethod
+    def _safe_inverse(mat: torch.Tensor) -> torch.Tensor:
+        try:
+            return torch.linalg.inv(mat)
+        except RuntimeError:
+            return torch.linalg.pinv(mat)
+
+    def _warp_guidance_to_occ_space(
+        self,
+        guidance: Optional[torch.Tensor],
+        target_hw: Sequence[int],
+        lidar_aug_matrix: Optional[torch.Tensor],
+        lidar2ego: Optional[torch.Tensor],
+        occ_aug_matrix: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if guidance is None:
+            return None
+        if guidance.dim() != 4 or guidance.shape[1] != 1:
+            return guidance
+        if (
+            lidar_aug_matrix is None
+            or lidar2ego is None
+            or occ_aug_matrix is None
+            or not torch.is_tensor(lidar_aug_matrix)
+            or not torch.is_tensor(lidar2ego)
+            or not torch.is_tensor(occ_aug_matrix)
+        ):
+            return guidance
+
+        b, _, src_h, src_w = guidance.shape
+        tgt_h, tgt_w = int(target_hw[0]), int(target_hw[1])
+        device = guidance.device
+        math_dtype = torch.float32
+
+        src_x_range = self.guidance_projector.source_x_range
+        src_y_range = self.guidance_projector.source_y_range
+        tgt_x_range = self.guidance_projector.target_x_range
+        tgt_y_range = self.guidance_projector.target_y_range
+        if src_x_range is None or src_y_range is None or tgt_x_range is None or tgt_y_range is None:
+            return guidance
+
+        x_step = (float(tgt_x_range[1]) - float(tgt_x_range[0])) / max(tgt_w, 1)
+        y_step = (float(tgt_y_range[1]) - float(tgt_y_range[0])) / max(tgt_h, 1)
+        x_coords = torch.arange(tgt_w, device=device, dtype=math_dtype)
+        y_coords = torch.arange(tgt_h, device=device, dtype=math_dtype)
+        x_coords = float(tgt_x_range[0]) + (x_coords + 0.5) * x_step
+        y_coords = float(tgt_y_range[0]) + (y_coords + 0.5) * y_step
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+        zeros = torch.zeros_like(xx)
+        pts_occ = torch.stack([xx, yy, zeros], dim=-1).view(1, -1, 3).expand(b, -1, -1)
+
+        occ = occ_aug_matrix.to(device=device, dtype=math_dtype)
+        l2e = lidar2ego.to(device=device, dtype=math_dtype)
+        laug = lidar_aug_matrix.to(device=device, dtype=math_dtype)
+        if occ.shape[0] != b:
+            occ = occ.expand(b, -1, -1)
+        if l2e.shape[0] != b:
+            l2e = l2e.expand(b, -1, -1)
+        if laug.shape[0] != b:
+            laug = laug.expand(b, -1, -1)
+
+        occ_rot = occ[:, :3, :3]
+        occ_trans = occ[:, :3, 3]
+        occ_inv = self._safe_inverse(occ_rot)
+        pts_ego = torch.bmm((pts_occ - occ_trans.unsqueeze(1)), occ_inv.transpose(1, 2))
+
+        l2e_rot = l2e[:, :3, :3]
+        l2e_trans = l2e[:, :3, 3]
+        l2e_inv = self._safe_inverse(l2e_rot)
+        pts_lidar = torch.bmm((pts_ego - l2e_trans.unsqueeze(1)), l2e_inv.transpose(1, 2))
+
+        laug_rot = laug[:, :3, :3]
+        laug_trans = laug[:, :3, 3]
+        pts_src = torch.bmm(pts_lidar, laug_rot.transpose(1, 2)) + laug_trans.unsqueeze(1)
+
+        xs = pts_src[..., 0].view(b, tgt_h, tgt_w)
+        ys = pts_src[..., 1].view(b, tgt_h, tgt_w)
+        src_x_denom = max(float(src_x_range[1] - src_x_range[0]), 1e-6)
+        src_y_denom = max(float(src_y_range[1] - src_y_range[0]), 1e-6)
+        xs = (xs - float(src_x_range[0])) / src_x_denom
+        ys = (ys - float(src_y_range[0])) / src_y_denom
+        xs = xs * 2.0 - 1.0
+        ys = ys * 2.0 - 1.0
+        grid = torch.stack([xs, ys], dim=-1)
+
+        mode = "nearest" if self.guidance_resize_mode == "nearest" else "bilinear"
+        warped = F.grid_sample(guidance, grid, mode=mode, padding_mode="zeros", align_corners=False)
+        return torch.nan_to_num(warped, nan=0.0, posinf=1.0, neginf=0.0)
+
     def forward(
         self,
         img_feats,
@@ -139,7 +228,20 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
             img_feats = self.coordinate_transform(img_feats, lidar_aug_matrix, lidar2ego, occ_aug_matrix)
             img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        guidance = self.guidance_projector(det_guidance_logits, img_feats.shape[-2:])
+        guidance = None
+        if det_guidance_logits is not None and det_guidance_logits.dim() >= 3:
+            src_hw = tuple(det_guidance_logits.shape[-2:])
+            guidance_src = self.guidance_projector(det_guidance_logits, src_hw)
+            guidance = self._warp_guidance_to_occ_space(
+                guidance=guidance_src,
+                target_hw=img_feats.shape[-2:],
+                lidar_aug_matrix=lidar_aug_matrix,
+                lidar2ego=lidar2ego,
+                occ_aug_matrix=occ_aug_matrix,
+            )
+        if guidance is None:
+            guidance = self.guidance_projector(det_guidance_logits, img_feats.shape[-2:])
+
         if guidance is not None:
             guidance = torch.nan_to_num(guidance, nan=0.0, posinf=1.0, neginf=0.0)
             hard_gate = (guidance >= self.guidance_threshold).to(img_feats.dtype)
@@ -213,8 +315,10 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
             and self._cached_occ_coarse.shape == occ_pred.shape
             and self._cached_occ_coarse.data_ptr() != occ_pred.data_ptr()
         ):
-            log_p = F.log_softmax(occ_pred, dim=-1)
-            q = F.softmax(self._cached_occ_coarse.detach(), dim=-1)
+            # Distill refined prediction into the coarse branch to avoid
+            # anchoring the refiner back to coarse mistakes.
+            log_p = F.log_softmax(self._cached_occ_coarse, dim=-1)
+            q = F.softmax(occ_pred.detach(), dim=-1)
             kl = F.kl_div(log_p, q, reduction="none").sum(dim=-1)
             if mask_camera is not None:
                 valid_mask = mask_camera.to(dtype=torch.bool)

@@ -61,10 +61,9 @@ class MambaRefinementSubHead(nn.Module):
 
         self.num_classes = num_classes
         self.dz = dz
-        self.residual_scale_max = float(residual_scale)
-        # Zero-init gate keeps the refinement head as identity at startup,
-        # protecting pretrained coarse logits from random residual noise.
-        self.residual_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        # Kept for config compatibility; refinement now uses unit residual
+        # with zero-initialized out_proj for stable startup.
+        _ = float(residual_scale)
         self.scan_orders = tuple(scan_orders)
         self.requested_mamba = bool(use_mamba)
         self.use_checkpoint = bool(use_checkpoint)
@@ -126,6 +125,10 @@ class MambaRefinementSubHead(nn.Module):
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1, padding=0, bias=True),
         )
         self.out_proj = nn.Linear(hidden_dim, num_classes * dz)
+        # Zero-init output projection keeps the refinement path as identity
+        # at startup while preserving gradient flow through the branch.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
         # Cache positional grid to avoid rebuilding linspace/meshgrid each forward.
         self.register_buffer("_xy_pos_cache", torch.empty(1, 0, 0, 2), persistent=False)
 
@@ -310,5 +313,6 @@ class MambaRefinementSubHead(nn.Module):
         if vis_xy is not None:
             residual = residual * vis_xy.unsqueeze(-1).unsqueeze(-1)
         residual = torch.nan_to_num(residual, nan=0.0, posinf=1e4, neginf=-1e4)
-        scale = self.residual_scale_max * torch.tanh(self.residual_scale).to(dtype=occ_logits.dtype)
-        return torch.nan_to_num(occ_logits + scale * residual, nan=0.0, posinf=1e4, neginf=-1e4)
+        return torch.nan_to_num(
+            occ_logits + residual, nan=0.0, posinf=1e4, neginf=-1e4
+        )
