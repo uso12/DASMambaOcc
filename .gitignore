@@ -4,3 +4,11 @@ __pycache__/
 *.pyd
 
 .DS_Store
+
+# Project artifacts/data
+work_dirs/*
+data/*
+
+# Also ignore if matched from parent-level path usage
+DASMambaOcc/work_dirs/*
+DASMambaOcc/data/*
