@@ -70,9 +70,15 @@ class AdaptiveLiftingBEVTransformV2(BEVTransformV2):
             tx = img_aug_matrix[..., 0, 3]
             ty = img_aug_matrix[..., 1, 3]
 
-        cam_vec = torch.stack([fx, fy, cx, cy, sx, sy, tx, ty], dim=-1)
-        norm = cam_vec.abs().mean(dim=-1, keepdim=True).clamp(min=1e-6)
-        return cam_vec / norm
+        intr_vec = torch.stack([fx, fy, cx, cy], dim=-1)
+        aug_vec = torch.stack([sx, sy, tx, ty], dim=-1)
+
+        intr_norm = intr_vec.abs().mean(dim=-1, keepdim=True).clamp(min=1e-6)
+        aug_norm = aug_vec.abs().mean(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        intr_vec = intr_vec / intr_norm
+        aug_vec = aug_vec / aug_norm
+        return torch.cat([intr_vec, aug_vec], dim=-1)
 
     def _apply_adaptive_lifting(
         self,

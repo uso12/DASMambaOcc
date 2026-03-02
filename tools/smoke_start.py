@@ -104,6 +104,7 @@ def _check_config_and_model(cfg_paths: List[Path], skip_model_build: bool, requi
 def _check_guidance_and_temporal_modules() -> None:
     from dasmambaocc.models.fusion_models.hybrid_bevfusion_plus import HybridBEVFusionPlus
     from dasmambaocc.models.modules.detection_guidance import DetectionGuidanceProjector
+    from dasmambaocc.models.vtransforms.adaptive_lift_vtransform import AdaptiveLiftingBEVTransformV2
     from dasmambaocc.models.modules.temporal_memory import FeatureMemoryBank
 
     _echo("Checking detection guidance extraction")
@@ -130,6 +131,45 @@ def _check_guidance_and_temporal_modules() -> None:
     upsampled = nearest_projector(coarse, target_hw=(4, 4))
     if not bool((upsampled[:, :, :2, :2] > 0.9).all() and (upsampled[:, :, 2:, 2:] < 0.1).all()):
         raise RuntimeError("Nearest guidance resize check failed")
+
+    range_projector = DetectionGuidanceProjector(
+        blur_kernel=1,
+        interpolate_mode="nearest",
+        source_x_range=[-54.0, 54.0],
+        source_y_range=[-54.0, 54.0],
+        target_x_range=[-40.0, 40.0],
+        target_y_range=[-40.0, 40.0],
+    )
+    src_logits = torch.full((1, 1, 180, 180), -20.0)
+    src_logits[0, 0, 90, 90] = 20.0     # in-range center peak
+    src_logits[0, 0, 90, 179] = 20.0    # out-of-range edge peak
+    cropped = range_projector(src_logits, target_hw=(200, 200))
+    if cropped is None:
+        raise RuntimeError("Range-aware guidance projector returned None")
+    if float(cropped[0, 0, 100, 100]) < 0.9:
+        raise RuntimeError("Range-aware guidance projector lost center in-range peak")
+    if float(cropped[0, 0, :, 199].max()) > 0.1:
+        raise RuntimeError("Range-aware guidance projector failed to crop out-of-range edge peak")
+
+    intr = torch.zeros(1, 1, 4, 4)
+    intr[..., 0, 0] = 1000.0
+    intr[..., 1, 1] = 1000.0
+    intr[..., 0, 2] = 500.0
+    intr[..., 1, 2] = 500.0
+    intr[..., 2, 2] = 1.0
+
+    aug = torch.eye(4).view(1, 1, 4, 4).clone()
+    aug[..., 0, 0] = 1.2
+    aug[..., 1, 1] = 0.8
+    aug[..., 0, 3] = 10.0
+    aug[..., 1, 3] = -5.0
+
+    cam_vec = AdaptiveLiftingBEVTransformV2._camera_condition_vector(intr, aug)
+    if cam_vec is None or cam_vec.shape[-1] != 8:
+        raise RuntimeError("Camera condition vector check failed: invalid output shape")
+    aug_mag = float(cam_vec[..., 4:].abs().mean())
+    if aug_mag < 0.1:
+        raise RuntimeError("Camera condition vector check failed: augmentation terms were over-suppressed")
 
     _echo("Checking temporal memory gradient flow")
     bank = FeatureMemoryBank(momentum=0.9, blend=0.25, max_entries=16)
@@ -215,6 +255,19 @@ def _check_pipeline_contracts(daocc_root: Path) -> None:
         raise RuntimeError("ImageNormalizeSafe to_rgb conversion failed (blue channel remained active)")
     if float(normalized[0].mean()) < 0.9:
         raise RuntimeError("ImageNormalizeSafe to_rgb conversion failed (red channel not activated)")
+
+    # 4) Ensure map-output packaging in eval mode handles gt_masks_bev=None.
+    fusion_src = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "dasmambaocc"
+        / "models"
+        / "fusion_models"
+        / "hybrid_bevfusion_plus.py"
+    ).read_text()
+    expected_guard = '"gt_masks_bev": gt_masks_bev[k].cpu() if gt_masks_bev is not None else None'
+    if expected_guard not in fusion_src:
+        raise RuntimeError("HybridBEVFusionPlus map eval contract changed: missing gt_masks_bev None-guard")
 
 
 def parse_args() -> argparse.Namespace:

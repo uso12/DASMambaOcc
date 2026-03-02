@@ -273,7 +273,12 @@ class HybridBEVFusionPlus(BEVFusion):
         if "map" in self.heads:
             logits = self.heads["map"](x)
             for k in range(batch_size):
-                outputs[k].update({"masks_bev": logits[k].cpu(), "gt_masks_bev": gt_masks_bev[k].cpu()})
+                outputs[k].update(
+                    {
+                        "masks_bev": logits[k].cpu(),
+                        "gt_masks_bev": gt_masks_bev[k].cpu() if gt_masks_bev is not None else None,
+                    }
+                )
 
         if "occ" in self.heads:
             occ_head = self.heads["occ"]

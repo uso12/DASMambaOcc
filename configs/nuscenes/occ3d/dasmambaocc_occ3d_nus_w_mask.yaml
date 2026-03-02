@@ -184,6 +184,10 @@ model:
       guidance_threshold: 0.2
       guidance_blur_kernel: 3
       guidance_resize_mode: nearest
+      guidance_source_x_range: [-54.0, 54.0]
+      guidance_source_y_range: [-54.0, 54.0]
+      guidance_target_x_range: [-40.0, 40.0]
+      guidance_target_y_range: [-40.0, 40.0]
       use_temporal_memory: true
       temporal_momentum: 0.9
       temporal_blend: 0.25

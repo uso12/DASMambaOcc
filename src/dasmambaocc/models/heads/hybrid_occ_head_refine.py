@@ -24,6 +24,10 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         guidance_threshold: float = 0.2,
         guidance_blur_kernel: int = 3,
         guidance_resize_mode: str = "nearest",
+        guidance_source_x_range: Optional[tuple] = None,
+        guidance_source_y_range: Optional[tuple] = None,
+        guidance_target_x_range: Optional[tuple] = None,
+        guidance_target_y_range: Optional[tuple] = None,
         use_temporal_memory: bool = True,
         temporal_momentum: float = 0.9,
         temporal_blend: float = 0.25,
@@ -48,6 +52,10 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         self.guidance_projector = DetectionGuidanceProjector(
             blur_kernel=guidance_blur_kernel,
             interpolate_mode=guidance_resize_mode,
+            source_x_range=guidance_source_x_range,
+            source_y_range=guidance_source_y_range,
+            target_x_range=guidance_target_x_range,
+            target_y_range=guidance_target_y_range,
         )
 
         self.use_temporal_memory = use_temporal_memory
@@ -186,9 +194,18 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
             and self._cached_occ_coarse.shape == occ_pred.shape
             and self._cached_occ_coarse.data_ptr() != occ_pred.data_ptr()
         ):
-            loss_dict["loss_occ_refine_consistency"] = (
-                F.smooth_l1_loss(occ_pred, self._cached_occ_coarse.detach()) * self.refine_consistency_weight
-            )
+            log_p = F.log_softmax(occ_pred, dim=-1)
+            q = F.softmax(self._cached_occ_coarse.detach(), dim=-1)
+            kl = F.kl_div(log_p, q, reduction="none").sum(dim=-1)
+            if mask_camera is not None:
+                valid_mask = mask_camera.to(dtype=torch.bool)
+                if valid_mask.shape == kl.shape and valid_mask.any():
+                    kl = kl[valid_mask].mean()
+                else:
+                    kl = kl.mean()
+            else:
+                kl = kl.mean()
+            loss_dict["loss_occ_refine_consistency"] = kl * self.refine_consistency_weight
 
         guidance = self._resize_cached_guidance(occ_pred)
         if self.hard_negative_weight > 0 and guidance is not None:
