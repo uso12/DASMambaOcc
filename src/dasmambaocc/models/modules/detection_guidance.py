@@ -115,7 +115,9 @@ class DetectionGuidanceProjector(nn.Module):
 
         if self.blur_kernel > 1:
             pad = self.blur_kernel // 2
-            x = F.avg_pool2d(x, kernel_size=self.blur_kernel, stride=1, padding=pad)
+            # Use max pooling as morphological dilation to preserve sparse peaks
+            # from small objects while still expanding support.
+            x = F.max_pool2d(x, kernel_size=self.blur_kernel, stride=1, padding=pad)
 
         x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
         return x.clamp_(0.0, 1.0)
