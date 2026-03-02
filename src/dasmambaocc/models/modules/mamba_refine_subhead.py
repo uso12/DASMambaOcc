@@ -1,5 +1,7 @@
+import inspect
 import logging
 import warnings
+from contextlib import nullcontext
 from typing import Sequence, Tuple
 
 import torch
@@ -8,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 LOGGER = logging.getLogger(__name__)
+_CHECKPOINT_SUPPORTS_USE_REENTRANT = "use_reentrant" in inspect.signature(checkpoint).parameters
 
 
 class _FallbackMixerBlock(nn.Module):
@@ -120,32 +123,67 @@ class MambaRefinementSubHead(nn.Module):
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, stride=1, padding=0, bias=True),
         )
         self.out_proj = nn.Linear(hidden_dim, num_classes * dz)
+        # Cache positional grid to avoid rebuilding linspace/meshgrid each forward.
+        self.register_buffer("_xy_pos_cache", torch.empty(1, 0, 0, 2), persistent=False)
+
+    def _make_xy_pos(
+        self, batch_size: int, dx: int, dy: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        cache = self._xy_pos_cache
+        refresh_cache = (
+            cache.device != device
+            or cache.dtype != dtype
+            or cache.shape[1] < dx
+            or cache.shape[2] < dy
+        )
+        if refresh_cache:
+            xs = torch.linspace(-1.0, 1.0, dx, device=device, dtype=dtype).view(dx, 1).expand(dx, dy)
+            ys = torch.linspace(-1.0, 1.0, dy, device=device, dtype=dtype).view(1, dy).expand(dx, dy)
+            cache = torch.stack([xs, ys], dim=-1).unsqueeze(0)
+            self._xy_pos_cache = cache
+        return self._xy_pos_cache[:, :dx, :dy, :].expand(batch_size, dx, dy, 2)
 
     @staticmethod
-    def _make_xy_pos(batch_size: int, dx: int, dy: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        xs = torch.linspace(-1.0, 1.0, dx, device=device, dtype=dtype).view(dx, 1).expand(dx, dy)
-        ys = torch.linspace(-1.0, 1.0, dy, device=device, dtype=dtype).view(1, dy).expand(dx, dy)
-        pos = torch.stack([xs, ys], dim=-1)
-        return pos.unsqueeze(0).expand(batch_size, dx, dy, 2)
+    def _checkpoint_block(fn, x: torch.Tensor) -> torch.Tensor:
+        if _CHECKPOINT_SUPPORTS_USE_REENTRANT:
+            return checkpoint(fn, x, use_reentrant=False)
+        return checkpoint(fn, x)
 
     def _run_mixer(self, seq: torch.Tensor) -> torch.Tensor:
         can_checkpoint = self.use_checkpoint and self.training and seq.requires_grad
 
         if self.use_mamba:
-            for norm, layer in zip(self.mixer_norms, self.mixer_layers):
-                if can_checkpoint:
-                    def _mamba_block(x, _norm=norm, _layer=layer):
-                        return _layer(_norm(x))
-                    seq = seq + checkpoint(_mamba_block, seq)
-                else:
-                    seq = seq + layer(norm(seq))
-            return seq
+            input_dtype = seq.dtype
+            use_bf16 = bool(
+                seq.is_cuda and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            )
+            if not use_bf16:
+                # Keep Mamba numerics in fp32 when bf16 autocast is unavailable.
+                seq = seq.float()
+                self.mixer_norms.float()
+                self.mixer_layers.float()
+
+            amp_ctx = (
+                torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16)
+                if use_bf16
+                else (torch.cuda.amp.autocast(enabled=False) if seq.is_cuda else nullcontext())
+            )
+
+            with amp_ctx:
+                for norm, layer in zip(self.mixer_norms, self.mixer_layers):
+                    if can_checkpoint:
+                        def _mamba_block(x, _norm=norm, _layer=layer):
+                            return _layer(_norm(x))
+                        seq = seq + self._checkpoint_block(_mamba_block, seq)
+                    else:
+                        seq = seq + layer(norm(seq))
+            return seq.to(dtype=input_dtype)
 
         for layer in self.mixer_layers:
             if can_checkpoint:
                 def _fallback_block(x, _layer=layer):
                     return _layer(x)
-                seq = checkpoint(_fallback_block, seq)
+                seq = self._checkpoint_block(_fallback_block, seq)
             else:
                 seq = layer(seq)
         return seq
