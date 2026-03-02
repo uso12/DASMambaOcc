@@ -1,0 +1,9 @@
+name: dasmambaocc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pip<24
+  - setuptools<70
+  - wheel
+  - ninja
