@@ -120,7 +120,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         if guidance is None:
             return None
         if guidance.dim() != 4 or guidance.shape[1] != 1:
-            return guidance
+            return None
         if (
             lidar_aug_matrix is None
             or lidar2ego is None
@@ -129,7 +129,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
             or not torch.is_tensor(lidar2ego)
             or not torch.is_tensor(occ_aug_matrix)
         ):
-            return guidance
+            return None
 
         b, _, src_h, src_w = guidance.shape
         tgt_h, tgt_w = int(target_hw[0]), int(target_hw[1])
@@ -141,7 +141,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         tgt_x_range = self.guidance_projector.target_x_range
         tgt_y_range = self.guidance_projector.target_y_range
         if src_x_range is None or src_y_range is None or tgt_x_range is None or tgt_y_range is None:
-            return guidance
+            return None
 
         x_step = (float(tgt_x_range[1]) - float(tgt_x_range[0])) / max(tgt_w, 1)
         y_step = (float(tgt_y_range[1]) - float(tgt_y_range[0])) / max(tgt_h, 1)
@@ -189,7 +189,10 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
 
         mode = "nearest" if self.guidance_resize_mode == "nearest" else "bilinear"
         warped = F.grid_sample(guidance, grid, mode=mode, padding_mode="zeros", align_corners=False)
-        return torch.nan_to_num(warped, nan=0.0, posinf=1.0, neginf=0.0)
+        warped = torch.nan_to_num(warped, nan=0.0, posinf=1.0, neginf=0.0)
+        if warped.shape[-2:] != (tgt_h, tgt_w):
+            return None
+        return warped
 
     def forward(
         self,
