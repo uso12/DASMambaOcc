@@ -23,7 +23,12 @@ def hard_negative_suppression_loss(
     nonempty_prob = 1.0 - probs[..., empty_class_idx]
     nonempty_prob = torch.nan_to_num(nonempty_prob, nan=0.0, posinf=1.0, neginf=0.0)
 
-    det_mask_xy = det_guidance_xy[..., 0] >= guidance_threshold
+    if det_guidance_xy.dim() == 5:
+        det_mask_xy = det_guidance_xy[..., 0, 0] >= guidance_threshold
+    elif det_guidance_xy.dim() == 4:
+        det_mask_xy = det_guidance_xy[..., 0] >= guidance_threshold
+    else:
+        raise ValueError(f"det_guidance_xy must be 4D/5D, got shape {tuple(det_guidance_xy.shape)}")
     det_mask = det_mask_xy.unsqueeze(-1).expand_as(nonempty_prob)
 
     valid_mask = mask_camera.to(torch.bool)

@@ -115,6 +115,15 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         img_feats = einops.rearrange(img_feats, "bs c w h -> bs c h w")
         img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
 
+        # Temporal memory must run in pre-coordinate-transform space.
+        # Coordinate transform applies per-sample occupancy augmentation (flip/rot/scale);
+        # blending already-augmented features with raw ego-motion poses causes desync.
+        if self.use_temporal_memory:
+            if ego2global is None:
+                ego2global = camera_ego2global
+            img_feats = self.temporal_memory(img_feats, metas=metas, ego2global=ego2global)
+            img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
+
         if self.coordinate_transform is not None:
             img_feats = self.coordinate_transform(img_feats, lidar_aug_matrix, lidar2ego, occ_aug_matrix)
             img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -129,12 +138,6 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
             self._cached_guidance_xy = guidance.squeeze(1).permute(0, 2, 1).unsqueeze(-1).detach()
         else:
             self._cached_guidance_xy = None
-
-        if self.use_temporal_memory:
-            if ego2global is None:
-                ego2global = camera_ego2global
-            img_feats = self.temporal_memory(img_feats, metas=metas, ego2global=ego2global)
-            img_feats = torch.nan_to_num(img_feats, nan=0.0, posinf=1e4, neginf=-1e4)
 
         occ_coarse = self.final_conv(img_feats).permute(0, 3, 2, 1)
         bs, dx, dy = occ_coarse.shape[:3]

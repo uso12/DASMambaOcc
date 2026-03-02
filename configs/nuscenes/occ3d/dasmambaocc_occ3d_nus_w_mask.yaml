@@ -194,8 +194,8 @@ model:
       max_memory_entries: 2048
       temporal_max_timestamp_gap: 2000000
       temporal_enable_pose_warp: true
-      temporal_x_range: [-40.0, 40.0]
-      temporal_y_range: [-40.0, 40.0]
+      temporal_x_range: [-54.0, 54.0]
+      temporal_y_range: [-54.0, 54.0]
       hard_negative_weight: 0.2
       hard_negative_threshold: 0.15
       empty_class_idx: 17
@@ -228,6 +228,9 @@ model:
   loss_scale:
     object: 0.01
     occ: 1.0
+
+data:
+  train_shuffle: false
 
 optimizer:
   type: AdamW
