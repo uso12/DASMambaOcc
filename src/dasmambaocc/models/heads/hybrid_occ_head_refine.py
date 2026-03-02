@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Sequence
 
 import einops
 import torch
@@ -39,6 +39,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         hard_negative_weight: float = 0.2,
         hard_negative_threshold: float = 0.15,
         empty_class_idx: Optional[int] = None,
+        hard_negative_foreground_classes: Optional[Sequence[int]] = None,
         enable_refine_subhead: bool = True,
         refine_subhead: Optional[dict] = None,
         coarse_aux_weight: float = 0.2,
@@ -78,6 +79,10 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
                 f"empty_class_idx must be in [0, {self.num_classes - 1}], got {empty_class_idx}"
             )
         self.empty_class_idx = int(empty_class_idx)
+        if hard_negative_foreground_classes is None:
+            self.hard_negative_foreground_classes = None
+        else:
+            self.hard_negative_foreground_classes = [int(x) for x in hard_negative_foreground_classes]
 
         refine_subhead = dict(refine_subhead or {})
         self.enable_refine_subhead = enable_refine_subhead
@@ -220,6 +225,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
                 empty_class_idx=self.empty_class_idx,
                 guidance_threshold=self.hard_negative_threshold,
                 loss_weight=self.hard_negative_weight,
+                foreground_class_indices=self.hard_negative_foreground_classes,
             )
 
         if self.enable_refine_subhead and self.refine_subhead is not None:

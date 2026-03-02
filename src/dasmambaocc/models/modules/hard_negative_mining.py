@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -7,10 +7,11 @@ import torch.nn.functional as F
 def hard_negative_suppression_loss(
     occ_pred: torch.Tensor,
     det_guidance_xy: Optional[torch.Tensor],
-    mask_camera: torch.Tensor,
+    mask_camera: Optional[torch.Tensor],
     empty_class_idx: int,
     guidance_threshold: float,
     loss_weight: float,
+    foreground_class_indices: Optional[Sequence[int]] = None,
 ) -> torch.Tensor:
     """Penalize non-empty occupancy outside detector-supported regions."""
     if loss_weight <= 0 or det_guidance_xy is None:
@@ -20,7 +21,17 @@ def hard_negative_suppression_loss(
     det_guidance_xy = torch.nan_to_num(det_guidance_xy, nan=0.0, posinf=1.0, neginf=0.0)
     probs = occ_pred.softmax(dim=-1)
     probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
-    nonempty_prob = 1.0 - probs[..., empty_class_idx]
+
+    num_classes = int(probs.shape[-1])
+    if foreground_class_indices is not None:
+        fg_idx = torch.as_tensor(foreground_class_indices, device=probs.device, dtype=torch.long).view(-1)
+        valid = (fg_idx >= 0) & (fg_idx < num_classes) & (fg_idx != int(empty_class_idx))
+        fg_idx = fg_idx[valid].unique(sorted=True)
+        if fg_idx.numel() == 0:
+            return occ_pred.new_tensor(0.0)
+        nonempty_prob = probs.index_select(dim=-1, index=fg_idx).sum(dim=-1)
+    else:
+        nonempty_prob = 1.0 - probs[..., empty_class_idx]
     nonempty_prob = torch.nan_to_num(nonempty_prob, nan=0.0, posinf=1.0, neginf=0.0)
 
     if det_guidance_xy.dim() == 5:
@@ -31,7 +42,10 @@ def hard_negative_suppression_loss(
         raise ValueError(f"det_guidance_xy must be 4D/5D, got shape {tuple(det_guidance_xy.shape)}")
     det_mask = det_mask_xy.unsqueeze(-1).expand_as(nonempty_prob)
 
-    valid_mask = mask_camera.to(torch.bool)
+    if mask_camera is None:
+        valid_mask = torch.ones_like(nonempty_prob, dtype=torch.bool)
+    else:
+        valid_mask = mask_camera.to(torch.bool)
     neg_mask = valid_mask & (~det_mask)
 
     if int(neg_mask.sum()) == 0:

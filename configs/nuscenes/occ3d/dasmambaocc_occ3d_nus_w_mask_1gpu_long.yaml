@@ -160,6 +160,7 @@ model:
       hard_negative_weight: 0.2
       hard_negative_threshold: 0.15
       empty_class_idx: 17
+      hard_negative_foreground_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
       enable_refine_subhead: true
       refine_subhead:
         hidden_dim: 192
