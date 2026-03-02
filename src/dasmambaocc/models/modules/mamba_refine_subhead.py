@@ -61,7 +61,10 @@ class MambaRefinementSubHead(nn.Module):
 
         self.num_classes = num_classes
         self.dz = dz
-        self.residual_scale = residual_scale
+        self.residual_scale_max = float(residual_scale)
+        # Zero-init gate keeps the refinement head as identity at startup,
+        # protecting pretrained coarse logits from random residual noise.
+        self.residual_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.scan_orders = tuple(scan_orders)
         self.requested_mamba = bool(use_mamba)
         self.use_checkpoint = bool(use_checkpoint)
@@ -188,6 +191,53 @@ class MambaRefinementSubHead(nn.Module):
                 seq = layer(seq)
         return seq
 
+    @staticmethod
+    def _apply_occ_aug_to_pos(pos: torch.Tensor, occ_aug_matrix: torch.Tensor) -> torch.Tensor:
+        if occ_aug_matrix is None:
+            return pos
+        aug = torch.as_tensor(occ_aug_matrix, device=pos.device, dtype=pos.dtype)
+        if aug.dim() == 2:
+            aug = aug.unsqueeze(0)
+        if aug.dim() != 3 or aug.shape[-2:] != (4, 4):
+            return pos
+
+        b, dx, dy, _ = pos.shape
+        if aug.shape[0] == 1 and b > 1:
+            aug = aug.expand(b, -1, -1)
+        if aug.shape[0] != b:
+            return pos
+
+        rot = aug[:, :2, :2]
+        pos_flat = pos.reshape(b, dx * dy, 2)
+        pos_flat = torch.bmm(pos_flat, rot.transpose(1, 2))
+        return pos_flat.reshape(b, dx, dy, 2).clamp_(-1.0, 1.0)
+
+    @staticmethod
+    def _visibility_xy(
+        visibility_mask: torch.Tensor,
+        batch_size: int,
+        dx: int,
+        dy: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if visibility_mask is None:
+            return None
+        vis = torch.as_tensor(visibility_mask, device=device)
+
+        # [B, Dx, Dy, Dz] camera-visible voxels -> [B, Dx, Dy].
+        if vis.dim() == 4 and vis.shape[0] == batch_size and vis.shape[1] == dx and vis.shape[2] == dy:
+            if vis.shape[3] == 1:
+                vis = vis[..., 0]
+            else:
+                vis = vis.to(torch.bool).any(dim=-1)
+        elif vis.dim() == 3 and vis.shape[0] == batch_size and vis.shape[1] == dx and vis.shape[2] == dy:
+            pass
+        else:
+            return None
+
+        return vis.to(dtype=dtype).clamp_(0.0, 1.0)
+
     def _scan_once(self, tokens: torch.Tensor, order: str) -> torch.Tensor:
         # tokens: [B, Dx, Dy, C]
         b, dx, dy, c = tokens.shape
@@ -203,7 +253,13 @@ class MambaRefinementSubHead(nn.Module):
 
         raise ValueError(f"Unsupported scan order: {order}")
 
-    def forward(self, bev_feat_xy: torch.Tensor, occ_logits: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        bev_feat_xy: torch.Tensor,
+        occ_logits: torch.Tensor,
+        occ_aug_matrix: torch.Tensor = None,
+        visibility_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
         # bev_feat_xy: [B, C_bev, Dy, Dx]
         # occ_logits: [B, Dx, Dy, Dz, C_cls]
         b, dx, dy, dz, c_cls = occ_logits.shape
@@ -233,10 +289,17 @@ class MambaRefinementSubHead(nn.Module):
         tokens = self.token_proj(tokens)
 
         pos = self._make_xy_pos(b, dx, dy, tokens.device, tokens.dtype)
+        pos = self._apply_occ_aug_to_pos(pos, occ_aug_matrix)
         tokens = tokens + self.pos_proj(pos)
+
+        vis_xy = self._visibility_xy(visibility_mask, b, dx, dy, tokens.device, tokens.dtype)
+        if vis_xy is not None:
+            tokens = tokens * vis_xy.unsqueeze(-1)
 
         scanned = [self._scan_once(tokens, order) for order in self.scan_orders]
         fused = torch.stack(scanned, dim=0).mean(dim=0)
+        if vis_xy is not None:
+            fused = fused * vis_xy.unsqueeze(-1)
 
         # Local context processor (OccMamba LCP style) over BEV grid.
         fused_2d = fused.permute(0, 3, 2, 1).contiguous()  # [B, C, Dy, Dx]
@@ -244,5 +307,8 @@ class MambaRefinementSubHead(nn.Module):
         fused = fused_2d.permute(0, 3, 2, 1).contiguous()
 
         residual = self.out_proj(fused).view(b, dx, dy, dz, c_cls)
+        if vis_xy is not None:
+            residual = residual * vis_xy.unsqueeze(-1).unsqueeze(-1)
         residual = torch.nan_to_num(residual, nan=0.0, posinf=1e4, neginf=-1e4)
-        return torch.nan_to_num(occ_logits + self.residual_scale * residual, nan=0.0, posinf=1e4, neginf=-1e4)
+        scale = self.residual_scale_max * torch.tanh(self.residual_scale).to(dtype=occ_logits.dtype)
+        return torch.nan_to_num(occ_logits + scale * residual, nan=0.0, posinf=1e4, neginf=-1e4)

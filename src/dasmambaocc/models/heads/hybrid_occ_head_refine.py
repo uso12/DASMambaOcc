@@ -112,6 +112,7 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         metas=None,
         camera_ego2global: Optional[torch.Tensor] = None,
         ego2global: Optional[torch.Tensor] = None,
+        mask_camera: Optional[torch.Tensor] = None,
     ):
         if isinstance(img_feats, list):
             assert len(img_feats) == 1
@@ -159,7 +160,12 @@ class HybridBEVOCCHead2DRefine(BEVOCCHead2D):
         self._cached_occ_coarse = occ_coarse
 
         if self.enable_refine_subhead and self.refine_subhead is not None:
-            occ_pred = self.refine_subhead(img_feats, occ_coarse)
+            occ_pred = self.refine_subhead(
+                img_feats,
+                occ_coarse,
+                occ_aug_matrix=occ_aug_matrix,
+                visibility_mask=mask_camera,
+            )
         else:
             occ_pred = occ_coarse
 

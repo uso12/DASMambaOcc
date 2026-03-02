@@ -73,7 +73,7 @@ class HybridBEVFusionPlus(BEVFusion):
             extra_kwargs["det_guidance_logits"] = det_guidance
         if "metas" in params or supports_var_kwargs:
             extra_kwargs["metas"] = metas
-        for key in ("camera_ego2global", "ego2global"):
+        for key in ("camera_ego2global", "ego2global", "mask_camera"):
             if key in context_kwargs and (key in params or supports_var_kwargs):
                 extra_kwargs[key] = context_kwargs[key]
         return extra_kwargs
